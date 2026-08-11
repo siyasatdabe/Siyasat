@@ -1,12 +1,15 @@
 const express = require('express');
 const cors = require('cors');
-const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 require('dotenv').config();
+
+// Import Models
+const UserModel = require('./models/User');
+const ThesisModel = require('./models/Thesis');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -19,56 +22,26 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// Ensure uploads directory exists
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
 }
-
-// Serve uploaded files statically
 app.use('/uploads', express.static(uploadDir));
 
 // -----------------------------------------------------------------------------
-// PostgreSQL Pool Connection
-// -----------------------------------------------------------------------------
-const pool = new Pool({
-  user: process.env.DB_USER || 'postgres',
-  host: process.env.DB_HOST || 'localhost',
-  database: process.env.DB_NAME || 'siyasat_db',
-  password: process.env.DB_PASSWORD || 'postgres',
-  port: process.env.DB_PORT || 5432,
-});
-
-pool.connect((err, client, release) => {
-  if (err) {
-    console.error('❌ Database Connection Error:', err.stack);
-  } else {
-    console.log('✅ Connected to PostgreSQL Database: siyasat_db');
-    release();
-  }
-});
-
-// -----------------------------------------------------------------------------
-// Multer File Upload Setup (PDF only, 25MB max)
+// Multer Upload Setup (PDF only, 25MB Max)
 // -----------------------------------------------------------------------------
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, 'uploads/');
-  },
-  filename: (req, file, cb) => {
-    cb(null, `${Date.now()}-${file.originalname.replace(/\s+/g, '_')}`);
-  }
+  destination: (req, file, cb) => cb(null, 'uploads/'),
+  filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname.replace(/\s+/g, '_')}`)
 });
 
 const upload = multer({
-  storage: storage,
-  limits: { fileSize: 25 * 1024 * 1024 }, // 25 MB Limit
+  storage,
+  limits: { fileSize: 25 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    if (file.mimetype === 'application/pdf') {
-      cb(null, true);
-    } else {
-      cb(new Error('Only PDF files are allowed!'), false);
-    }
+    if (file.mimetype === 'application/pdf') cb(null, true);
+    else cb(new Error('Only PDF files are allowed!'), false);
   }
 });
 
@@ -89,7 +62,76 @@ const authenticateToken = (req, res, next) => {
 };
 
 // -----------------------------------------------------------------------------
-// API Endpoints
+// Helper 1: Universal PDF Text Extraction Helper
+// -----------------------------------------------------------------------------
+async function extractPdfText(filePath) {
+  try {
+    let parseFunc = null;
+
+    // Try standard require
+    try {
+      const mainModule = require('pdf-parse');
+      if (typeof mainModule === 'function') {
+        parseFunc = mainModule;
+      } else if (mainModule && typeof mainModule.default === 'function') {
+        parseFunc = mainModule.default;
+      } else if (mainModule && typeof mainModule.pdfParse === 'function') {
+        parseFunc = mainModule.pdfParse;
+      }
+    } catch (e) { }
+
+    // Fallback directly to library core file if main export fails
+    if (!parseFunc) {
+      try {
+        parseFunc = require('pdf-parse/lib/pdf-parse.js');
+      } catch (e) { }
+    }
+
+    if (typeof parseFunc !== 'function') {
+      console.error('❌ PDF Parser Error: Unable to resolve pdf-parse module entry point.');
+      return '';
+    }
+
+    const dataBuffer = fs.readFileSync(filePath);
+    const parsedPdf = await parseFunc(dataBuffer);
+    return parsedPdf.text || '';
+  } catch (err) {
+    console.error('PDF Text Extraction Failed:', err.message);
+    return '';
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Helper 2: N-Gram Text Similarity Algorithm (3-Word N-Grams)
+// -----------------------------------------------------------------------------
+function calculateTextSimilarity(text1, text2, ngramSize = 3) {
+  if (!text1 || !text2) return 0;
+  const clean1 = text1.toLowerCase().replace(/[^\w\s]/gi, '').split(/\s+/);
+  const clean2 = text2.toLowerCase().replace(/[^\w\s]/gi, '').split(/\s+/);
+
+  if (clean1.length < ngramSize || clean2.length < ngramSize) return 0;
+
+  const getNGrams = (words) => {
+    const nGrams = new Set();
+    for (let i = 0; i <= words.length - ngramSize; i++) {
+      nGrams.add(words.slice(i, i + ngramSize).join(' '));
+    }
+    return nGrams;
+  };
+
+  const set1 = getNGrams(clean1);
+  const set2 = getNGrams(clean2);
+
+  let matchCount = 0;
+  for (const gram of set1) {
+    if (set2.has(gram)) matchCount++;
+  }
+
+  return Math.round((matchCount / Math.min(set1.size, set2.size)) * 100);
+}
+
+// -----------------------------------------------------------------------------
+// API Routes
 // -----------------------------------------------------------------------------
 
 // Health Check
@@ -97,42 +139,25 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', message: 'SIYASAT API Server is running.' });
 });
 
-// 1. User Registration Endpoint
+// 1. User Registration
 app.post('/api/auth/register', async (req, res) => {
   const { full_name, email, password, role } = req.body;
-
   if (!email || !password || !full_name) {
     return res.status(400).json({ message: 'Full name, email, and password are required.' });
   }
 
   try {
-    // Check if user already exists
-    const existingUser = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-    if (existingUser.rows.length > 0) {
+    const existing = await UserModel.findByEmail(email);
+    if (existing) {
       return res.status(400).json({ message: 'User with this email already exists.' });
     }
 
-    // Hash password
-    const saltRounds = 10;
-    const passwordHash = await bcrypt.hash(password, saltRounds);
-
-    // Default role validation
+    const passwordHash = await bcrypt.hash(password, 10);
     const userRole = ['STUDENT', 'ADVISER', 'ADMIN'].includes(role) ? role : 'STUDENT';
+    const user = await UserModel.create(full_name, email, passwordHash, userRole);
 
-    // Insert new user into PostgreSQL
-    const query = `
-      INSERT INTO users (full_name, email, password_hash, role, status)
-      VALUES ($1, $2, $3, $4, 'ACTIVE')
-      RETURNING id, full_name, email, role, status;
-    `;
-    const result = await pool.query(query, [full_name, email, passwordHash, userRole]);
-
-    res.status(201).json({
-      message: 'Account registered successfully.',
-      user: result.rows[0]
-    });
+    res.status(201).json({ message: 'Account registered successfully.', user });
   } catch (err) {
-    console.error('Registration Error:', err);
     res.status(500).json({ message: 'Server error during registration: ' + err.message });
   }
 });
@@ -142,56 +167,35 @@ app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
 
   try {
-    const userRes = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-    if (userRes.rows.length === 0) {
-      return res.status(400).json({ message: 'Invalid credentials.' });
-    }
+    const user = await UserModel.findByEmail(email);
+    if (!user) return res.status(400).json({ message: 'Invalid credentials.' });
 
-    const user = userRes.rows[0];
-
-    // Check account status
     if (user.status === 'BLOCKED') {
       return res.status(403).json({ message: 'Account is blocked. Contact administrator.' });
     }
 
-    // Check temporary lockout
     if (user.lockout_until && new Date(user.lockout_until) > new Date()) {
       const remainingTime = Math.ceil((new Date(user.lockout_until) - new Date()) / 1000 / 60);
       return res.status(403).json({
-        message: `Account is temporarily locked due to failed attempts. Try again in ${remainingTime} minutes.`
+        message: `Account temporarily locked due to failed attempts. Try again in ${remainingTime} minutes.`
       });
     }
 
-    // Verify Password
     const isMatch = await bcrypt.compare(password, user.password_hash);
 
     if (!isMatch) {
       const attempts = (user.failed_login_attempts || 0) + 1;
-      let lockoutUntil = null;
+      let lockoutUntil = attempts >= 5 ? new Date(Date.now() + 15 * 60 * 1000) : null;
+      await UserModel.recordFailedAttempt(user.id, attempts, lockoutUntil);
 
-      if (attempts >= 5) {
-        // Lock for 15 minutes after 5 failed attempts
-        lockoutUntil = new Date(Date.now() + 15 * 60 * 1000);
-        await pool.query(
-          'UPDATE users SET failed_login_attempts = $1, lockout_until = $2 WHERE id = $3',
-          [0, lockoutUntil, user.id]
-        );
-        return res.status(403).json({
-          message: 'Account locked due to 5 failed login attempts. Try again in 15 minutes.'
-        });
+      if (lockoutUntil) {
+        return res.status(403).json({ message: 'Account locked due to 5 failed attempts. Try again in 15 minutes.' });
       }
 
-      await pool.query('UPDATE users SET failed_login_attempts = $1 WHERE id = $2', [attempts, user.id]);
-      return res.status(400).json({
-        message: `Invalid credentials. ${5 - attempts} attempt(s) remaining before lockout.`
-      });
+      return res.status(400).json({ message: `Invalid credentials. ${5 - attempts} attempt(s) remaining.` });
     }
 
-    // Reset failed attempts on success
-    await pool.query(
-      'UPDATE users SET failed_login_attempts = 0, lockout_until = NULL WHERE id = $1',
-      [user.id]
-    );
+    await UserModel.resetAttempts(user.id);
 
     const token = jwt.sign(
       { id: user.id, email: user.email, role: user.role, full_name: user.full_name },
@@ -202,176 +206,156 @@ app.post('/api/auth/login', async (req, res) => {
     res.json({
       message: 'Login successful',
       token,
-      user: {
-        id: user.id,
-        full_name: user.full_name,
-        email: user.email,
-        role: user.role,
-        status: user.status
-      }
+      user: { id: user.id, full_name: user.full_name, email: user.email, role: user.role, status: user.status }
     });
   } catch (err) {
-    console.error('Login Error:', err);
     res.status(500).json({ message: 'Internal server error during authentication.' });
   }
 });
 
-// 3. Fetch Theses with Multi-Criteria Search & Filters (Publicly Accessible)
+// 3. Search & Filter Theses
 app.get('/api/theses', async (req, res) => {
-  const { q, year, sort } = req.query;
-
   try {
-    let queryStr = 'SELECT * FROM theses WHERE 1=1';
-    const params = [];
-
-    if (q) {
-      params.push(`%${q}%`);
-      queryStr += ` AND (title ILIKE $${params.length} OR author ILIKE $${params.length} OR keywords ILIKE $${params.length} OR abstract ILIKE $${params.length})`;
-    }
-
-    if (year) {
-      params.push(parseInt(year, 10));
-      queryStr += ` AND year = $${params.length}`;
-    }
-
-    if (sort === 'year_desc') {
-      queryStr += ' ORDER BY year DESC, created_at DESC';
-    } else if (sort === 'title_asc') {
-      queryStr += ' ORDER BY title ASC';
-    } else {
-      queryStr += ' ORDER BY created_at DESC';
-    }
-
-    const result = await pool.query(queryStr, params);
-    res.json({ theses: result.rows });
+    const theses = await ThesisModel.findAll(req.query);
+    res.json({ theses });
   } catch (err) {
-    console.error('Search Error:', err);
     res.status(500).json({ message: 'Failed to retrieve theses.' });
   }
 });
 
-// 4. Upload New Thesis Route (Authenticated Admins & Advisers)
+// 4. Upload Thesis with Paraphrase Duplicate Scanner
 app.post('/api/theses', authenticateToken, upload.single('file'), async (req, res) => {
   try {
-    const { title, author, year, keywords, abstract, department } = req.body;
-
-    if (!req.file) {
-      return res.status(400).json({ message: 'Please attach a valid PDF file under 25 MB.' });
-    }
+    const { title, author, year, keywords, abstract, department, ignoreDuplicate } = req.body;
+    if (!req.file) return res.status(400).json({ message: 'Please attach a valid PDF file under 25 MB.' });
 
     const normalizedPath = req.file.path.replace(/\\/g, '/');
 
-    const query = `
-      INSERT INTO theses (title, abstract, author, year, keywords, department, file_path, uploaded_by)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      RETURNING *;
-    `;
-    const values = [
+    // Extract PDF text
+    const fullPdfText = await extractPdfText(req.file.path);
+    const completePaperContent = `${title} ${abstract} ${fullPdfText}`;
+
+    // Full-Paper Similarity Check against database records
+    if (!ignoreDuplicate || ignoreDuplicate !== 'true') {
+      const existingTheses = await ThesisModel.getAllForScanning();
+
+      for (const existing of existingTheses) {
+        let existingFullText = `${existing.title} ${existing.abstract}`;
+
+        if (existing.file_path && fs.existsSync(existing.file_path)) {
+          const existingPdfText = await extractPdfText(existing.file_path);
+          existingFullText += ` ${existingPdfText}`;
+        }
+
+        // Run 3-word n-gram similarity check
+        const similarityScore = calculateTextSimilarity(completePaperContent, existingFullText, 3);
+
+        // Threshold check (>= 15% similarity or exact title match)
+        if (similarityScore >= 15 || (existing.title && title.toLowerCase().trim() === existing.title.toLowerCase().trim())) {
+          return res.status(409).json({
+            message: `Possible Duplicate Found! The uploaded PDF shares a ${similarityScore}% content similarity match with existing paper: "${existing.title}".`,
+            duplicateId: existing.id,
+            similarityScore
+          });
+        }
+      }
+    }
+
+    const thesis = await ThesisModel.create({
       title,
       abstract,
       author,
-      parseInt(year, 10) || new Date().getFullYear(),
-      keywords || '',
-      department || 'Department of Agricultural and Biosystems Engineering',
-      normalizedPath,
-      req.user.id
-    ];
+      year,
+      keywords,
+      department,
+      filePath: normalizedPath,
+      uploadedBy: req.user.id
+    });
 
-    const result = await pool.query(query, values);
-    res.status(201).json({ message: 'Thesis successfully uploaded to repository.', thesis: result.rows[0] });
+    res.status(201).json({ message: 'Thesis successfully uploaded to repository.', thesis });
   } catch (err) {
     console.error('Upload Error:', err);
-    res.status(500).json({ message: 'Internal server error during upload: ' + err.message });
+    res.status(500).json({ message: 'Internal server error during document scanning: ' + err.message });
   }
 });
 
-// 5. Delete Thesis (Admin Only)
-app.delete('/api/theses/:id', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'ADMIN') {
-    return res.status(403).json({ message: 'Access denied. Administrator privileges required.' });
+// 5. Update Thesis Metadata
+app.put('/api/theses/:id', authenticateToken, upload.single('file'), async (req, res) => {
+  if (req.user.role !== 'ADMIN' && req.user.role !== 'ADVISER') {
+    return res.status(403).json({ message: 'Access denied.' });
   }
 
   try {
-    await pool.query('DELETE FROM theses WHERE id = $1', [req.params.id]);
+    const filePath = req.file ? req.file.path.replace(/\\/g, '/') : null;
+    const thesis = await ThesisModel.update(req.params.id, { ...req.body, filePath });
+
+    if (!thesis) return res.status(404).json({ message: 'Thesis paper not found.' });
+    res.json({ message: 'Thesis updated successfully.', thesis });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to update thesis record.' });
+  }
+});
+
+// 6. Delete Thesis (Admin Only)
+app.delete('/api/theses/:id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'ADMIN') return res.status(403).json({ message: 'Administrator privileges required.' });
+
+  try {
+    await ThesisModel.delete(req.params.id);
     res.json({ message: 'Thesis deleted successfully.' });
   } catch (err) {
-    console.error('Delete Error:', err);
     res.status(500).json({ message: 'Failed to delete thesis record.' });
   }
 });
 
-// 6. AI Research Gap Analysis Tool Route
+// 7. AI Research Gap Analysis Tool
 app.post('/api/theses/:id/analyze-gap', authenticateToken, async (req, res) => {
   try {
-    const thesisRes = await pool.query('SELECT * FROM theses WHERE id = $1', [req.params.id]);
-    if (thesisRes.rows.length === 0) {
-      return res.status(404).json({ message: 'Thesis record not found.' });
-    }
-
-    const thesis = thesisRes.rows[0];
-
-    const identifiedGaps = `1. Limited real-time data collection in extreme weather conditions within ${thesis.department}.\n2. High deployment cost for low-resource regional farms.\n3. Lack of long-term predictive machine learning models based on local soil datasets.`;
-    const futureRecommendations = `1. Integrate IoT sensor telemetry with low-power LoRaWAN networks for extended range.\n2. Develop solar-powered edge hardware modules to reduce reliance on grid power.\n3. Conduct multi-seasonal field trials across diverse agro-climatic zones in Central Luzon.`;
+    const thesis = await ThesisModel.findById(req.params.id);
+    if (!thesis) return res.status(404).json({ message: 'Thesis record not found.' });
 
     const report = {
       thesis_id: thesis.id,
-      identified_gaps: identifiedGaps,
-      future_recommendations: futureRecommendations
+      identified_gaps: `1. Limited real-time data collection in extreme weather conditions within ${thesis.department}.\n2. High deployment cost for low-resource regional farms.\n3. Lack of long-term predictive machine learning models based on local soil datasets.`,
+      future_recommendations: `1. Integrate IoT sensor telemetry with low-power LoRaWAN networks for extended range.\n2. Develop solar-powered edge hardware modules to reduce reliance on grid power.\n3. Conduct multi-seasonal field trials across diverse agro-climatic zones in Central Luzon.`
     };
 
     res.json({ message: 'AI Analysis complete', report });
   } catch (err) {
-    console.error('AI Analysis Error:', err);
     res.status(500).json({ message: 'Failed to generate AI Research Gap Report.' });
   }
 });
 
-// 7. Admin User Management Routes
+// 8. Admin User Management
 app.get('/api/admin/users', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'ADMIN') {
-    return res.status(403).json({ message: 'Administrator access required.' });
-  }
-
+  if (req.user.role !== 'ADMIN') return res.status(403).json({ message: 'Administrator access required.' });
   try {
-    const users = await pool.query('SELECT id, full_name, email, role, status, created_at FROM users ORDER BY id ASC');
-    res.json({ users: users.rows });
+    const users = await UserModel.getAllUsers();
+    res.json({ users });
   } catch (err) {
-    console.error('Fetch Users Error:', err);
     res.status(500).json({ message: 'Failed to retrieve registered users.' });
   }
 });
 
 app.put('/api/admin/users/:id/status', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'ADMIN') {
-    return res.status(403).json({ message: 'Administrator access required.' });
-  }
-
-  const { status } = req.body;
+  if (req.user.role !== 'ADMIN') return res.status(403).json({ message: 'Administrator access required.' });
   try {
-    await pool.query('UPDATE users SET status = $1 WHERE id = $2', [status, req.params.id]);
-    res.json({ message: `User status updated to ${status}.` });
+    await UserModel.updateStatus(req.params.id, req.body.status);
+    res.json({ message: `User status updated to ${req.body.status}.` });
   } catch (err) {
-    console.error('Update Status Error:', err);
     res.status(500).json({ message: 'Failed to update user status.' });
   }
 });
 
 app.put('/api/admin/users/:id/role', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'ADMIN') {
-    return res.status(403).json({ message: 'Administrator access required.' });
-  }
-
-  const { role } = req.body;
+  if (req.user.role !== 'ADMIN') return res.status(403).json({ message: 'Administrator access required.' });
   try {
-    await pool.query('UPDATE users SET role = $1 WHERE id = $2', [role, req.params.id]);
-    res.json({ message: `User role updated to ${role}.` });
+    await UserModel.updateRole(req.params.id, req.body.role);
+    res.json({ message: `User role updated to ${req.body.role}.` });
   } catch (err) {
-    console.error('Update Role Error:', err);
     res.status(500).json({ message: 'Failed to update user role.' });
   }
 });
 
 // Start Express Server
-app.listen(PORT, () => {
-  console.log(`🚀 SIYASAT Backend Server running on http://localhost:${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 SIYASAT Backend Server running on http://localhost:${PORT}`));
