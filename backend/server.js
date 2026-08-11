@@ -106,20 +106,15 @@ app.post('/api/auth/register', async (req, res) => {
   }
 
   try {
-    // Check if user already exists
     const existingUser = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     if (existingUser.rows.length > 0) {
       return res.status(400).json({ message: 'User with this email already exists.' });
     }
 
-    // Hash password
     const saltRounds = 10;
     const passwordHash = await bcrypt.hash(password, saltRounds);
-
-    // Default role validation
     const userRole = ['STUDENT', 'ADVISER', 'ADMIN'].includes(role) ? role : 'STUDENT';
 
-    // Insert new user into PostgreSQL
     const query = `
       INSERT INTO users (full_name, email, password_hash, role, status)
       VALUES ($1, $2, $3, $4, 'ACTIVE')
@@ -149,12 +144,10 @@ app.post('/api/auth/login', async (req, res) => {
 
     const user = userRes.rows[0];
 
-    // Check account status
     if (user.status === 'BLOCKED') {
       return res.status(403).json({ message: 'Account is blocked. Contact administrator.' });
     }
 
-    // Check temporary lockout
     if (user.lockout_until && new Date(user.lockout_until) > new Date()) {
       const remainingTime = Math.ceil((new Date(user.lockout_until) - new Date()) / 1000 / 60);
       return res.status(403).json({
@@ -162,7 +155,6 @@ app.post('/api/auth/login', async (req, res) => {
       });
     }
 
-    // Verify Password
     const isMatch = await bcrypt.compare(password, user.password_hash);
 
     if (!isMatch) {
@@ -170,7 +162,6 @@ app.post('/api/auth/login', async (req, res) => {
       let lockoutUntil = null;
 
       if (attempts >= 5) {
-        // Lock for 15 minutes after 5 failed attempts
         lockoutUntil = new Date(Date.now() + 15 * 60 * 1000);
         await pool.query(
           'UPDATE users SET failed_login_attempts = $1, lockout_until = $2 WHERE id = $3',
@@ -187,7 +178,6 @@ app.post('/api/auth/login', async (req, res) => {
       });
     }
 
-    // Reset failed attempts on success
     await pool.query(
       'UPDATE users SET failed_login_attempts = 0, lockout_until = NULL WHERE id = $1',
       [user.id]
@@ -216,9 +206,9 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// 3. Fetch Theses with Multi-Criteria Search & Filters (Publicly Accessible)
+// 3. Fetch Theses with Multi-Criteria Search & Filters
 app.get('/api/theses', async (req, res) => {
-  const { q, year, sort } = req.query;
+  const { q, year, branch, sort } = req.query;
 
   try {
     let queryStr = 'SELECT * FROM theses WHERE 1=1';
@@ -234,8 +224,15 @@ app.get('/api/theses', async (req, res) => {
       queryStr += ` AND year = $${params.length}`;
     }
 
-    if (sort === 'year_desc') {
+    if (branch) {
+      params.push(`%${branch}%`);
+      queryStr += ` AND department ILIKE $${params.length}`;
+    }
+
+    if (sort === 'year_desc' || sort === 'descending') {
       queryStr += ' ORDER BY year DESC, created_at DESC';
+    } else if (sort === 'year_asc' || sort === 'ascending') {
+      queryStr += ' ORDER BY year ASC, created_at ASC';
     } else if (sort === 'title_asc') {
       queryStr += ' ORDER BY title ASC';
     } else {
@@ -250,7 +247,7 @@ app.get('/api/theses', async (req, res) => {
   }
 });
 
-// 4. Upload New Thesis Route (Authenticated Admins & Advisers)
+// 4. Upload New Thesis Route
 app.post('/api/theses', authenticateToken, upload.single('file'), async (req, res) => {
   try {
     const { title, author, year, keywords, abstract, department } = req.body;
@@ -272,7 +269,7 @@ app.post('/api/theses', authenticateToken, upload.single('file'), async (req, re
       author,
       parseInt(year, 10) || new Date().getFullYear(),
       keywords || '',
-      department || 'Department of Agricultural and Biosystems Engineering',
+      department || 'Land and Water Resources Engineering',
       normalizedPath,
       req.user.id
     ];
@@ -285,7 +282,45 @@ app.post('/api/theses', authenticateToken, upload.single('file'), async (req, re
   }
 });
 
-// 5. Delete Thesis (Admin Only)
+// 5. Update/Edit Thesis Route
+app.put('/api/theses/:id', authenticateToken, upload.single('file'), async (req, res) => {
+  if (req.user.role !== 'ADMIN' && req.user.role !== 'ADVISER') {
+    return res.status(403).json({ message: 'Access denied. Insufficient permissions.' });
+  }
+
+  const thesisId = req.params.id;
+  const { title, author, year, keywords, abstract, department } = req.body;
+
+  try {
+    let updateQuery = `
+      UPDATE theses 
+      SET title = $1, author = $2, year = $3, keywords = $4, abstract = $5, department = $6
+    `;
+    const params = [title, author, parseInt(year, 10), keywords, abstract, department];
+
+    if (req.file) {
+      const normalizedPath = req.file.path.replace(/\\/g, '/');
+      params.push(normalizedPath);
+      updateQuery += `, file_path = $${params.length}`;
+    }
+
+    params.push(thesisId);
+    updateQuery += ` WHERE id = $${params.length} RETURNING *;`;
+
+    const result = await pool.query(updateQuery, params);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Thesis paper not found.' });
+    }
+
+    res.json({ message: 'Thesis updated successfully.', thesis: result.rows[0] });
+  } catch (err) {
+    console.error('Update Thesis Error:', err);
+    res.status(500).json({ message: 'Failed to update thesis record.' });
+  }
+});
+
+// 6. Delete Thesis
 app.delete('/api/theses/:id', authenticateToken, async (req, res) => {
   if (req.user.role !== 'ADMIN') {
     return res.status(403).json({ message: 'Access denied. Administrator privileges required.' });
@@ -300,7 +335,7 @@ app.delete('/api/theses/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// 6. AI Research Gap Analysis Tool Route
+// 7. AI Research Gap Analysis Tool Route
 app.post('/api/theses/:id/analyze-gap', authenticateToken, async (req, res) => {
   try {
     const thesisRes = await pool.query('SELECT * FROM theses WHERE id = $1', [req.params.id]);
@@ -326,7 +361,7 @@ app.post('/api/theses/:id/analyze-gap', authenticateToken, async (req, res) => {
   }
 });
 
-// 7. Admin User Management Routes
+// 8. Admin User Management Routes
 app.get('/api/admin/users', authenticateToken, async (req, res) => {
   if (req.user.role !== 'ADMIN') {
     return res.status(403).json({ message: 'Administrator access required.' });
