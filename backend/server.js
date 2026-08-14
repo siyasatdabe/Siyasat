@@ -5,6 +5,7 @@ const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const OpenAI = require('openai');
 require('dotenv').config();
 
 // Import Models
@@ -15,11 +16,17 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'siyasat_super_secret_key_2026';
 
+// Initialize Groq AI Client (100% Free Cloud API)
+const groq = new OpenAI({
+  apiKey: process.env.GROQ_API_KEY || 'dummy_key',
+  baseURL: 'https://api.groq.com/openai/v1'
+});
+
 // -----------------------------------------------------------------------------
 // Middleware & Body Parsers
 // -----------------------------------------------------------------------------
 app.use(cors({
-  origin: '*', // Allows local testing without CORS blocking
+  origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
@@ -50,7 +57,6 @@ const upload = multer({
   }
 });
 
-// Safe Multer Middleware Wrapper
 const safeUploadSingle = (fieldName) => (req, res, next) => {
   upload.single(fieldName)(req, res, (err) => {
     if (err) {
@@ -62,22 +68,20 @@ const safeUploadSingle = (fieldName) => (req, res, next) => {
 };
 
 // -----------------------------------------------------------------------------
-// JWT Middleware (Safe Mode)
+// JWT Middleware (Safe Mode with Integer Fallback)
 // -----------------------------------------------------------------------------
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
-  // For seamless local testing, allow requests with mock fallback user if no token provided
   if (!token) {
-    req.user = { id: 'mock-admin', role: 'ADMIN', full_name: 'Admin User' };
+    req.user = { id: 1, role: 'ADMIN', full_name: 'Admin User' };
     return next();
   }
 
   jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err) {
-      // Fallback to demo user instead of crashing frontend with 403
-      req.user = { id: 'mock-admin', role: 'ADMIN', full_name: 'Admin User' };
+      req.user = { id: 1, role: 'ADMIN', full_name: 'Admin User' };
       return next();
     }
     req.user = user;
@@ -246,7 +250,7 @@ app.get('/api/theses', async (req, res) => {
   }
 });
 
-// 4. Upload Thesis
+// 4. Upload Thesis (Safe Integer Fallback for PostgreSQL)
 app.post('/api/theses', authenticateToken, safeUploadSingle('file'), async (req, res) => {
   try {
     const { title, author, year, keywords, abstract, department, ignoreDuplicate } = req.body;
@@ -288,7 +292,7 @@ app.post('/api/theses', authenticateToken, safeUploadSingle('file'), async (req,
       keywords,
       department,
       filePath: normalizedPath,
-      uploadedBy: req.user?.id || 'admin'
+      uploadedBy: req.user?.id || 1
     });
 
     res.status(201).json({ message: 'Thesis successfully uploaded to repository.', thesis });
@@ -298,25 +302,28 @@ app.post('/api/theses', authenticateToken, safeUploadSingle('file'), async (req,
   }
 });
 
-// 5. Update Thesis Metadata (FIXED FOR SAFE EDITING)
+// 5. Update Thesis Metadata
 app.put('/api/theses/:id', authenticateToken, safeUploadSingle('file'), async (req, res) => {
   try {
+    const paperId = parseInt(req.params.id, 10);
+    if (isNaN(paperId)) {
+      return res.status(400).json({ message: 'Invalid thesis ID: must be a valid integer.' });
+    }
+
     const filePath = req.file ? req.file.path.replace(/\\/g, '/') : null;
     const updatePayload = { ...req.body };
     if (filePath) updatePayload.filePath = filePath;
 
-    const thesis = await ThesisModel.update(req.params.id, updatePayload);
+    const thesis = await ThesisModel.update(paperId, updatePayload);
 
-    // Return success response even if mock DB record
     res.json({
       message: 'Thesis updated successfully.',
-      thesis: thesis || { id: req.params.id, ...updatePayload }
+      thesis
     });
   } catch (err) {
     console.error('Update Error:', err);
-    res.status(200).json({
-      message: 'Thesis update recorded.',
-      thesis: { id: req.params.id, ...req.body }
+    res.status(500).json({
+      message: 'Failed to update thesis: ' + err.message
     });
   }
 });
@@ -324,27 +331,98 @@ app.put('/api/theses/:id', authenticateToken, safeUploadSingle('file'), async (r
 // 6. Delete Thesis
 app.delete('/api/theses/:id', authenticateToken, async (req, res) => {
   try {
-    await ThesisModel.delete(req.params.id);
-    res.json({ message: 'Thesis deleted successfully.' });
+    const paperId = parseInt(req.params.id, 10);
+    if (isNaN(paperId)) {
+      return res.status(400).json({ message: 'Invalid thesis ID: must be a valid integer.' });
+    }
+
+    const deleted = await ThesisModel.delete(paperId);
+    if (!deleted) {
+      return res.status(404).json({ message: `Thesis with ID ${paperId} not found.` });
+    }
+
+    res.json({ message: 'Thesis deleted successfully.', deletedId: paperId });
   } catch (err) {
-    res.status(500).json({ message: 'Failed to delete thesis record.' });
+    console.error('Delete Error:', err);
+    res.status(500).json({ message: 'Failed to delete thesis record: ' + err.message });
   }
 });
 
-// 7. AI Research Gap Analysis
-app.post('/api/theses/:id/analyze-gap', authenticateToken, async (req, res) => {
+// 7. REAL AI RESEARCH GAP ANALYSIS (Llama 3.3 via Groq Free API)
+app.post('/api/analyze-gaps', async (req, res) => {
   try {
-    const thesis = await ThesisModel.findById(req.params.id);
+    const { title, abstract, department, keywords } = req.body;
 
-    const report = {
-      thesis_id: req.params.id,
-      identified_gaps: `1. Limited real-time data collection in extreme weather conditions within ${thesis?.department || 'engineering'}.\n2. High deployment cost for low-resource regional farms.\n3. Lack of long-term predictive machine learning models based on local soil datasets.`,
-      future_recommendations: `1. Integrate IoT sensor telemetry with low-power LoRaWAN networks for extended range.\n2. Develop solar-powered edge hardware modules to reduce reliance on grid power.\n3. Conduct multi-seasonal field trials across diverse agro-climatic zones.`
-    };
+    if (!title && !abstract) {
+      return res.status(400).json({
+        success: false,
+        message: 'Thesis title or abstract is required for AI gap analysis.'
+      });
+    }
 
-    res.json({ message: 'AI Analysis complete', report });
-  } catch (err) {
-    res.status(500).json({ message: 'Failed to generate AI Research Gap Report.' });
+    const systemPrompt = `
+You are an expert academic research advisor specializing in Agricultural and Biosystems Engineering (ABE).
+Analyze the provided thesis details and identify 4 to 5 distinct, highly practical research gaps or recommendations for future study.
+
+OUTPUT FORMAT INSTRUCTION:
+Return your response STRICTLY as a JSON object with a single root key named "gaps" containing an array of gap objects.
+Example output format:
+{
+  "gaps": [
+    {
+      "id": 1,
+      "title": "Short 5-8 word summary of the gap",
+      "desc": "2-3 sentences explaining the research gap and why further study is needed."
+    }
+  ]
+}
+
+Do not include any text, markdown formatting, or markdown code blocks outside of the JSON object.
+`;
+
+    const userPrompt = `
+Thesis Title: ${title || 'N/A'}
+Department/Branch: ${department || 'N/A'}
+Keywords: ${keywords || 'N/A'}
+Abstract: ${abstract || 'N/A'}
+`;
+
+    const response = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ],
+      temperature: 0.5,
+      response_format: { type: 'json_object' }
+    });
+
+    const rawContent = response.choices[0].message.content.trim();
+    let parsedData;
+
+    try {
+      parsedData = JSON.parse(rawContent);
+    } catch (parseError) {
+      console.error('Failed to parse AI JSON output:', rawContent);
+      return res.status(500).json({
+        success: false,
+        message: 'AI returned malformed JSON response.'
+      });
+    }
+
+    const gaps = Array.isArray(parsedData)
+      ? parsedData
+      : (parsedData.gaps || parsedData.research_gaps || []);
+
+    return res.json({ success: true, gaps });
+
+  } catch (error) {
+    console.error('AI Gap Analysis Error:', error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to generate AI gap analysis.',
+      error: error.message
+    });
   }
 });
 
