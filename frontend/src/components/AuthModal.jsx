@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { Loader2 } from 'lucide-react';
+import SiyasatLogo from './SiyasatLogo';
 
 const AuthModal = ({ isOpen = true, onClose, onLoginSuccess, API_BASE = (process.env.REACT_APP_API_URL || 'https://siyasat-backend.onrender.com/api') }) => {
   const [email, setEmail] = useState('');
@@ -16,7 +17,10 @@ const AuthModal = ({ isOpen = true, onClose, onLoginSuccess, API_BASE = (process
     setSuccessMsg('');
     setIsLoading(true);
 
-    const endpoint = `${API_BASE}/auth/login`;
+    const baseUrl = process.env.REACT_APP_API_URL || 'https://siyasat-backend.onrender.com/api';
+    // Ensure we don't end up with /api/api/auth/login or missing segments
+    const cleanBaseUrl = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
+    const endpoint = cleanBaseUrl.endsWith('/api') ? `${cleanBaseUrl}/auth/login` : `${cleanBaseUrl}/api/auth/login`;
     const payload = { email, password };
 
     try {
@@ -61,8 +65,8 @@ const AuthModal = ({ isOpen = true, onClose, onLoginSuccess, API_BASE = (process
 
         <div className="md:col-span-5 relative flex flex-col justify-center items-center text-center p-8 text-white bg-[#800000]">
           <div className="relative z-10 space-y-4">
-            <div className="inline-block border-4 border-white px-6 py-2 rounded-2xl mb-2 backdrop-blur-sm">
-              <span className="text-4xl md:text-5xl font-black font-serif">SIYASAT</span>
+            <div className="flex justify-center mb-2">
+              <SiyasatLogo variant="white" size="lg" />
             </div>
             <h2 className="text-xl md:text-2xl font-bold">A Research and Thesis Repository with AI Gap Analysis Tool</h2>
           </div>
